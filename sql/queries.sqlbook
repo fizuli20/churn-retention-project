@@ -1,0 +1,235 @@
+-- SQLBook: Code
+-- Active: 1768568094800@@127.0.0.1@5432@churn_retention
+
+TRUNCATE TABLE
+  support_tickets,
+  payments,
+  usage_metrics,
+  subscriptions,
+  customers
+RESTART IDENTITY
+CASCADE;
+
+
+INSERT INTO customers (signup_date, country, acquisition_channel)
+SELECT
+  (DATE '2022-01-01' + (random() * 730)::int) AS signup_date,
+  (ARRAY['USA','UK','Germany','France','Canada'])[1 + (random()*4)::int] AS country,
+  (ARRAY['Google Ads','Referral','LinkedIn','Organic'])[1 + (random()*3)::int] AS acquisition_channel
+FROM generate_series(1, 10000);
+SELECT COUNT(*) FROM customers;
+
+INSERT INTO subscriptions (customer_id, plan_type, monthly_fee, start_date, churn_date, churned)
+SELECT
+  c.customer_id,
+  plan.plan_type,
+  plan.monthly_fee,
+  c.signup_date AS start_date,
+  CASE
+    WHEN random() < 0.25 THEN c.signup_date + ((90 + (random()*510)::int))  -- 90 to 600 days
+    ELSE NULL
+  END AS churn_date,
+  CASE WHEN random() < 0.25 THEN TRUE ELSE FALSE END AS churned
+FROM customers c
+JOIN LATERAL (
+  SELECT
+    CASE
+      WHEN r < 0.5 THEN 'Basic'
+      WHEN r < 0.8 THEN 'Pro'
+      ELSE 'Premium'
+    END AS plan_type,
+    CASE
+      WHEN r < 0.5 THEN 29.99
+      WHEN r < 0.8 THEN 59.99
+      ELSE 99.99
+    END::numeric(10,2) AS monthly_fee
+  FROM (SELECT random() AS r) x
+) plan ON TRUE;
+SELECT COUNT(*) FROM subscriptions;
+SELECT churned, COUNT(*) FROM subscriptions GROUP BY churned;
+
+INSERT INTO usage_metrics (customer_id, usage_month, sessions, minutes_used)
+SELECT
+  s.customer_id,
+  m.month::date AS usage_month,
+  GREATEST(0, (base_sessions + (random()*6 - 3))::int) AS sessions,
+  GREATEST(0, (base_minutes + (random()*120 - 60))::int) AS minutes_used
+FROM subscriptions s
+JOIN LATERAL (
+  SELECT
+    CASE s.plan_type
+      WHEN 'Basic' THEN 12
+      WHEN 'Pro' THEN 20
+      ELSE 28
+    END AS base_sessions,
+    CASE s.plan_type
+      WHEN 'Basic' THEN 240
+      WHEN 'Pro' THEN 420
+      ELSE 600
+    END AS base_minutes
+) b ON TRUE
+JOIN LATERAL (
+  SELECT generate_series(
+    date_trunc('month', s.start_date),
+    date_trunc('month', COALESCE(s.churn_date, s.start_date + INTERVAL '23 months')),
+    INTERVAL '1 month'
+  ) AS month
+) m ON TRUE;
+SELECT COUNT(*) FROM usage_metrics;
+INSERT INTO payments (customer_id, payment_date, amount, payment_status)
+SELECT
+  s.customer_id,
+  (m.month + ((random()*27)::int) * INTERVAL '1 day')::date AS payment_date,
+  CASE WHEN r < 0.05 THEN 0 ELSE s.monthly_fee END AS amount,
+  CASE
+    WHEN r < 0.05 THEN 'Failed'
+    WHEN r < 0.12 THEN 'Late'
+    ELSE 'Paid'
+  END AS payment_status
+FROM subscriptions s
+JOIN LATERAL (
+  SELECT generate_series(
+    date_trunc('month', s.start_date),
+    date_trunc('month', COALESCE(s.churn_date, s.start_date + INTERVAL '23 months')),
+    INTERVAL '1 month'
+  ) AS month
+) m ON TRUE
+JOIN LATERAL (SELECT random() AS r) x ON TRUE;
+SELECT COUNT(*) FROM payments;
+INSERT INTO support_tickets (customer_id, ticket_date, issue_type, resolved)
+SELECT
+  s.customer_id,
+  (m.month + ((random()*27)::int) * INTERVAL '1 day')::date AS ticket_date,
+  (ARRAY['Billing','Login','Performance','Feature Request','Cancellation','Other'])[1 + (random()*5)::int] AS issue_type,
+  (random() < 0.85) AS resolved
+FROM subscriptions s
+JOIN LATERAL (
+  SELECT generate_series(
+    date_trunc('month', s.start_date),
+    date_trunc('month', COALESCE(s.churn_date, s.start_date + INTERVAL '23 months')),
+    INTERVAL '1 month'
+  ) AS month
+) m ON TRUE
+WHERE random() < 0.07;
+SELECT COUNT(*) FROM support_tickets;
+
+WITH usage_agg AS (
+  SELECT customer_id, AVG(sessions)::numeric AS avg_sessions
+  FROM usage_metrics
+  GROUP BY customer_id
+),
+payment_agg AS (
+  SELECT customer_id,
+         COUNT(*) FILTER (WHERE payment_status IN ('Late','Failed')) AS risky_payments
+  FROM payments
+  GROUP BY customer_id
+),
+ticket_agg AS (
+  SELECT customer_id, COUNT(*) AS total_tickets
+  FROM support_tickets
+  GROUP BY customer_id
+),
+risk AS (
+  SELECT
+    s.customer_id,
+    s.churned,
+    (CASE WHEN u.avg_sessions < 12 THEN 1 ELSE 0 END) +
+    (CASE WHEN COALESCE(p.risky_payments,0) >= 1 THEN 1 ELSE 0 END) +
+    (CASE WHEN COALESCE(t.total_tickets,0) >= 1 THEN 1 ELSE 0 END) AS risk_score
+  FROM subscriptions s
+  LEFT JOIN usage_agg u USING (customer_id)
+  LEFT JOIN payment_agg p USING (customer_id)
+  LEFT JOIN ticket_agg t USING (customer_id)
+)
+SELECT
+  risk_score,
+  COUNT(*) AS customers,
+  ROUND(SUM(s.monthly_fee)::numeric, 2) AS monthly_revenue
+FROM risk r
+JOIN subscriptions s USING (customer_id)
+GROUP BY risk_score
+ORDER BY risk_score DESC;
+
+
+
+
+CREATE OR REPLACE VIEW v_risk_tiers AS
+SELECT
+  r.customer_id,
+  r.risk_score,
+  CASE
+    WHEN r.risk_score >= 2 THEN 'High'
+    WHEN r.risk_score = 1 THEN 'Medium'
+    ELSE 'Low'
+  END AS risk_tier
+FROM (
+  -- paste your risk CTE logic as a view if you saved it;
+  -- if not, we’ll formalize it next in step 2
+  SELECT 1 AS customer_id, 0 AS risk_score
+) r;
+
+CREATE OR REPLACE VIEW v_risk_score AS
+WITH usage_agg AS (
+  SELECT customer_id, AVG(sessions)::numeric AS avg_sessions
+  FROM usage_metrics
+  GROUP BY customer_id
+),
+payment_agg AS (
+  SELECT customer_id,
+         COUNT(*) FILTER (WHERE payment_status IN ('Late','Failed')) AS risky_payments
+  FROM payments
+  GROUP BY customer_id
+),
+ticket_agg AS (
+  SELECT customer_id, COUNT(*) AS total_tickets
+  FROM support_tickets
+  GROUP BY customer_id
+)
+SELECT
+  s.customer_id,
+  s.plan_type,
+  s.monthly_fee,
+  s.churned,
+  (CASE WHEN u.avg_sessions < 12 THEN 1 ELSE 0 END) +
+  (CASE WHEN COALESCE(p.risky_payments,0) >= 1 THEN 1 ELSE 0 END) +
+  (CASE WHEN COALESCE(t.total_tickets,0) >= 1 THEN 1 ELSE 0 END) AS risk_score
+FROM subscriptions s
+LEFT JOIN usage_agg u USING (customer_id)
+LEFT JOIN payment_agg p USING (customer_id)
+LEFT JOIN ticket_agg t USING (customer_id);
+
+SELECT * FROM v_risk_score LIMIT 10;
+
+WITH high_risk AS (
+  SELECT *
+  FROM v_risk_score
+  WHERE risk_score >= 2
+),
+scenario AS (
+  SELECT
+    0.15::numeric AS retention_uplift -- assume we retain 15% of high-risk customers
+)
+SELECT
+  ROUND(SUM(monthly_fee)::numeric, 2) AS high_risk_mrr,
+  ROUND(SUM(monthly_fee)::numeric * (SELECT retention_uplift FROM scenario), 2) AS mrr_saved,
+  ROUND(SUM(monthly_fee)::numeric * (SELECT retention_uplift FROM scenario) * 12, 2) AS annual_revenue_saved
+FROM high_risk;
+
+-- Drop all experimental views (safe)
+DROP VIEW IF EXISTS
+  v_kpis_overall,
+  v_monthly_churn,
+  v_revenue_at_risk,
+  v_usage_trends,
+  v_recent_3m,
+  v_usage_drop_flag,
+  v_recent_drop_count,
+  v_anchor_month,
+  v_pre_anchor_3m,
+  v_risk_signals,
+  v_churn_risk_score,
+  v_risk_tiers,
+  v_risk_score
+CASCADE;
+
+
