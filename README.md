@@ -132,3 +132,11 @@ The Power BI dashboard provides an executive overview of churn risk and revenue 
 
 **Fizuli Hasanov**  
 Aspiring Data Analyst | SQL · Analytics · Business Intelligence
+
+## 📬 Contact
+
+If you'd like to connect or collaborate:
+
+## LinkedIn: https://www.linkedin.com/in/fizuli-hasanov
+
+## Tableau Public: https://public.tableau.com/app/profile/fizuli.hasanov
